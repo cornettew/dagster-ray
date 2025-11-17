@@ -96,7 +96,7 @@ def k8s_with_kuberay(
     request, kuberay_helm_repo, dagster_ray_image: str, kuberay_version: str
 ) -> Iterator[AClusterManager]:
     k8s = select_provider_manager("minikube")(KUBERNETES_CONTEXT[7:])  # strip pytest-
-    k8s.create(ClusterOptions(api_version=KUBERNETES_VERSION), cluster_timeout=600)
+    k8s.create(ClusterOptions(api_version=KUBERNETES_VERSION, cluster_timeout=600), timeout=600)
     # load images in advance to avoid possible timeouts later on
     k8s.load_image(f"quay.io/kuberay/operator:v{kuberay_version}")
 
