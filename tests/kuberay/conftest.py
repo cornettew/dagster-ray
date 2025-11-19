@@ -54,7 +54,12 @@ def dagster_ray_image():
 
         image = f"local.io/registry/dagster-ray:py-{python_version}-{ray_version}-{dagster_version}"
 
-        subprocess.run(
+        logger.info(f"Building Docker image: {image}")
+        logger.info(
+            f"Build args: PYTHON_VERSION={python_version}, RAY_VERSION={ray_version}, DAGSTER_VERSION={dagster_version}"
+        )
+
+        result = subprocess.run(
             [
                 "docker",
                 "build",
@@ -72,8 +77,16 @@ def dagster_ray_image():
                 image,
                 str(ROOT_DIR),
             ],
-            check=True,
+            check=False,
+            capture_output=True,
+            text=True,
         )
+
+        if result.returncode != 0:
+            logger.error(f"Docker build failed with exit code {result.returncode}")
+            logger.error(f"STDOUT:\n{result.stdout}")
+            logger.error(f"STDERR:\n{result.stderr}")
+            raise subprocess.CalledProcessError(result.returncode, result.args, result.stdout, result.stderr)
     else:
         image = PYTEST_DAGSTER_RAY_IMAGE
 
