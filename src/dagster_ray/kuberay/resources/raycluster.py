@@ -1,9 +1,12 @@
+import random
 from collections.abc import Sequence
 from datetime import datetime
+from time import sleep
 from typing import cast
 
 import dagster as dg
 from pydantic import Field, PrivateAttr
+from tenacity import retry, stop_after_attempt, wait_random
 from typing_extensions import override
 
 from dagster_ray._base.cluster_sharing_lock import ClusterSharingLock
@@ -25,6 +28,10 @@ class KubeRayClusterClientResource(dg.ConfigurableResource[RayClusterClient]):
     def create_resource(self, context: dg.InitResourceContext) -> RayClusterClient:
         client = RayClusterClient(kube_context=self.kube_context, kube_config=self.kube_config)
         return client
+
+
+class _SharedClusterNotFound(Exception):
+    pass
 
 
 class KubeRayCluster(BaseKubeRayResource):
@@ -112,16 +119,27 @@ class KubeRayCluster(BaseKubeRayResource):
         annotations: dict[str, str] = {}
 
         if self.cluster_sharing.enabled:
+            # Add a small random wait to help prevent race conditions when multiple steps
+            # attempt to create a shared cluster simultaneously
+            sleep(random.uniform(0, 1))
+
             label_selector = self.get_sharing_label_selector(context)
             context.log.info(
                 f"RayCluster sharing is enabled. Looking for clusters matching label selector: {label_selector}"
             )
-            # check whether a cluster matching the sharing config already exists
-            matching_clusters = self.client.list(
-                label_selector=label_selector,
-                namespace=self.namespace,
-            ).get("items", [])
-            if matching_clusters:
+
+            @retry(stop=stop_after_attempt(3), wait=wait_random(min=0.5, max=1.5), reraise=True)
+            def find_shared_cluster() -> list[dict]:
+                matching = self.client.list(
+                    label_selector=label_selector,
+                    namespace=self.namespace,
+                ).get("items", [])
+                if not matching:
+                    raise _SharedClusterNotFound()
+                return matching
+
+            try:
+                matching_clusters = find_shared_cluster()
                 cluster_name = matching_clusters[0]["metadata"]["name"]
                 context.log.info(
                     f"Found {len(matching_clusters)} clusters matching the label selector. Using the first one: {cluster_name}"
@@ -148,11 +166,11 @@ class KubeRayCluster(BaseKubeRayResource):
                 )
 
                 return
-            else:
-                context.log.info("No matching clusters found. Creating a new one.")
+            except _SharedClusterNotFound:
+                context.log.info("No matching shared clusters found. Will create a new shared cluster.")
 
-                # mark the cluster as being used by this step
-                annotations.update(self.get_sharing_lock_annotations(context))
+            # mark the cluster as being used by this step
+            annotations.update(self.get_sharing_lock_annotations(context))
 
         self._name = self.ray_cluster.metadata.get("name") or self._get_step_name(context)
 

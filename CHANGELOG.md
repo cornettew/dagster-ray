@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `RayCluster`'s head pod logs are now displayed on startup timeout or failure
+- added a small random wait period before creating a new `RayCluster` with cluster sharing enabled. This ensures proper reusal when multiple steps attempt to create a cluster at the same time.
 
 ## 0.4.0
 
