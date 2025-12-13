@@ -24,7 +24,8 @@ from dagster._utils.error import serializable_error_info_from_exc_info
 from packaging.version import Version
 from pydantic import Field
 
-from dagster_ray.configs import RayExecutionConfig, RayJobSubmissionClientConfig
+from dagster_ray.configs import ActorPoolConfig, RayExecutionConfig, RayJobSubmissionClientConfig
+from dagster_ray.core.actor_pool import DagsterWorkerPool
 from dagster_ray.utils import resolve_env_vars_list
 
 if TYPE_CHECKING:
@@ -40,6 +41,10 @@ class RayLauncherConfig(RayExecutionConfig, RayJobSubmissionClientConfig):
         default=None,
         description="A list of environment variables to inject into the Job. Each can be of the form KEY=VALUE or just KEY (in which case the value will be pulled from the current process).",
     )
+    actor_pool: ActorPoolConfig = Field(
+        default_factory=ActorPoolConfig,
+        description="Configuration for the prewarmed actor pool. When enabled, runs are executed by reusable actors instead of isolated jobs.",
+    )
 
 
 class RayRunLauncher(RunLauncher, ConfigurableClass):
@@ -47,6 +52,10 @@ class RayRunLauncher(RunLauncher, ConfigurableClass):
 
     Configuration can be provided via `dagster.yaml` and individual runs can override
     settings using the `dagster-ray/config` tag.
+
+    The launcher supports two execution modes:
+    1. **Job Submission** (default): Each run is submitted as an isolated Ray job
+    2. **Actor Pool**: Runs are executed by prewarmed, reusable actors for faster startup
 
     Example:
         Configure via `dagster.yaml`
@@ -58,6 +67,23 @@ class RayRunLauncher(RunLauncher, ConfigurableClass):
             address: "ray://head-node:10001"
             num_cpus: 2
             num_gpus: 0
+        ```
+
+    Example:
+        Enable prewarmed actor pool for faster run startup
+        ```yaml
+        run_launcher:
+          module: dagster_ray
+          class: RayRunLauncher
+          config:
+            address: "ray://head-node:10001"
+            actor_pool:
+              enabled: true
+              num_workers: 4
+              worker_num_cpus: 2
+              worker_num_gpus: 0
+              auto_scale: true
+              max_workers: 10
         ```
 
     Example:
@@ -77,6 +103,27 @@ class RayRunLauncher(RunLauncher, ConfigurableClass):
         def my_job():
             return my_op()
         ```
+
+    Example:
+        Programmatically interact with the actor pool
+        ```python
+        from dagster_ray import RayRunLauncher
+
+        launcher = instance.run_launcher  # Get the run launcher from your Dagster instance
+
+        # Prewarm the pool before runs
+        status = launcher.prewarm_pool()
+        print(f"Pool has {status['idle_workers']} idle workers")
+
+        # Scale the pool dynamically
+        launcher.scale_pool(num_workers=8)
+
+        # Get pool status
+        status = launcher.get_pool_status()
+
+        # Shutdown the pool when done
+        launcher.shutdown_pool()
+        ```
     """
 
     def __init__(
@@ -91,6 +138,7 @@ class RayRunLauncher(RunLauncher, ConfigurableClass):
         num_gpus: int | None = None,
         memory: int | None = None,
         resources: dict[str, float] | None = None,
+        actor_pool: dict[str, Any] | None = None,
         inst_data: ConfigurableClassData | None = None,
     ):
         self._inst_data = dg._check.opt_inst_param(inst_data, "inst_data", ConfigurableClassData)
@@ -106,6 +154,10 @@ class RayRunLauncher(RunLauncher, ConfigurableClass):
         self.memory = memory
         self.resources = resources
 
+        # Actor pool configuration
+        self.actor_pool_config = ActorPoolConfig(**(actor_pool or {}))
+        self._worker_pool = None
+
         super().__init__()
 
     @functools.cached_property
@@ -118,6 +170,98 @@ class RayRunLauncher(RunLauncher, ConfigurableClass):
         from ray.job_submission import JobSubmissionClient
 
         return JobSubmissionClient(self.address, metadata=self.metadata, headers=self.headers, cookies=self.cookies)
+
+    @property
+    def worker_pool(self):
+        """Get or create the worker pool if actor pool is enabled."""
+        if not self.actor_pool_config.enabled:
+            return None
+
+        if self._worker_pool is None:
+            import ray
+
+            # Initialize Ray if not already connected
+            if not ray.is_initialized():
+                ray.init(address=self.address, ignore_reinit_error=True)
+
+            worker_options = {}
+            if self.actor_pool_config.worker_num_cpus is not None:
+                worker_options["num_cpus"] = self.actor_pool_config.worker_num_cpus
+            if self.actor_pool_config.worker_num_gpus is not None:
+                worker_options["num_gpus"] = self.actor_pool_config.worker_num_gpus
+            if self.actor_pool_config.worker_memory is not None:
+                worker_options["memory"] = self.actor_pool_config.worker_memory
+            if self.actor_pool_config.worker_resources is not None:
+                worker_options["resources"] = self.actor_pool_config.worker_resources
+            if self.actor_pool_config.worker_runtime_env is not None:
+                worker_options["runtime_env"] = self.actor_pool_config.worker_runtime_env
+
+            self._worker_pool = DagsterWorkerPool.get_or_create(
+                num_workers=self.actor_pool_config.num_workers,
+                worker_options=worker_options if worker_options else None,
+            )
+
+        return self._worker_pool
+
+    def prewarm_pool(self) -> dict[str, Any]:
+        """Prewarm the actor pool. Call this before launching runs to ensure workers are ready.
+
+        Returns:
+            Dict with pool status information
+        """
+        import ray
+
+        if not self.actor_pool_config.enabled:
+            return {"error": "Actor pool is not enabled"}
+
+        pool = self.worker_pool
+        if pool is None:
+            return {"error": "Failed to create worker pool"}
+        return ray.get(pool.get_pool_status.remote())  # type: ignore[union-attr]
+
+    def get_pool_status(self) -> dict[str, Any] | None:
+        """Get the current status of the actor pool.
+
+        Returns:
+            Dict with pool status or None if pool is not enabled
+        """
+        import ray
+
+        if not self.actor_pool_config.enabled or self._worker_pool is None:
+            return None
+
+        return ray.get(self._worker_pool.get_pool_status.remote())
+
+    def scale_pool(self, num_workers: int) -> dict[str, Any]:
+        """Scale the actor pool to the specified number of workers.
+
+        Args:
+            num_workers: The desired number of workers
+
+        Returns:
+            Dict with scaling result
+        """
+        import ray
+
+        if not self.actor_pool_config.enabled:
+            return {"error": "Actor pool is not enabled"}
+
+        pool = self.worker_pool
+        if pool is None:
+            return {"error": "Failed to create worker pool"}
+        return ray.get(pool.scale_workers.remote(num_workers))  # type: ignore[union-attr]
+
+    def shutdown_pool(self):
+        """Shutdown the actor pool and all workers."""
+        import ray
+
+        if self._worker_pool is not None:
+            try:
+                ray.get(self._worker_pool.shutdown.remote())
+                ray.kill(self._worker_pool)
+            except Exception:
+                pass
+            self._worker_pool = None
 
     @property
     def inst_data(self) -> ConfigurableClassData | None:
@@ -160,7 +304,100 @@ class RayRunLauncher(RunLauncher, ConfigurableClass):
         # wrap the json in quotes to prevent errors with shell commands
         args[-1] = "'" + args[-1] + "'"
 
-        self._launch_ray_job(submission_id, " ".join(args), run)
+        entrypoint = " ".join(args)
+
+        # Use actor pool if enabled
+        if self.actor_pool_config.enabled:
+            self._launch_via_actor_pool(run, entrypoint)
+        else:
+            self._launch_ray_job(submission_id, entrypoint, run)
+
+    def _launch_via_actor_pool(self, run: DagsterRun, entrypoint: str) -> None:
+        """Launch a run using the prewarmed actor pool."""
+        import ray
+        from typing import Any
+
+        self._instance.report_engine_event(
+            "Submitting run to actor pool",
+            run,
+            EngineEventData(
+                {
+                    "Run ID": run.run_id,
+                    "Pool Workers": str(self.actor_pool_config.num_workers),
+                }
+            ),
+            cls=self.__class__,
+        )
+
+        pool = self.worker_pool
+
+        # Check pool status and auto-scale if needed
+        if self.actor_pool_config.auto_scale:
+            pool_status: dict[str, Any] = ray.get(pool.get_pool_status.remote())  # type: ignore[union-attr]
+            if pool_status["idle_workers"] == 0 and pool_status["num_workers"] < self.actor_pool_config.max_workers:
+                new_count = min(pool_status["num_workers"] + 1, self.actor_pool_config.max_workers)
+                ray.get(pool.scale_workers.remote(new_count))  # type: ignore[union-attr]
+                self._instance.report_engine_event(
+                    f"Auto-scaled actor pool to {new_count} workers",
+                    run,
+                    cls=self.__class__,
+                )
+
+        # Submit the run to the pool
+        result: dict[str, Any] = ray.get(pool.submit_run.remote(run.run_id, entrypoint))  # type: ignore[union-attr]
+
+        if result["success"]:
+            self._instance.report_engine_event(
+                "Run submitted to actor pool",
+                run,
+                EngineEventData(
+                    {
+                        "Worker ID": result["worker_id"],
+                        "Run ID": run.run_id,
+                    }
+                ),
+                cls=self.__class__,
+            )
+        else:
+            if self.actor_pool_config.queue_runs:
+                # Queue the run - it will be picked up when a worker becomes available
+                self._instance.report_engine_event(
+                    "No available workers, run queued",
+                    run,
+                    EngineEventData({"Error": result.get("error", "Unknown")}),
+                    cls=self.__class__,
+                )
+                # Retry submission in a background task
+                self._queue_run_for_pool(run, entrypoint)
+            else:
+                # Fall back to job submission
+                self._instance.report_engine_event(
+                    "No available workers, falling back to job submission",
+                    run,
+                    cls=self.__class__,
+                )
+                submission_id = get_job_submission_id_from_run_id(run.run_id)
+                self._launch_ray_job(submission_id, entrypoint, run)
+
+    def _queue_run_for_pool(self, run: DagsterRun, entrypoint: str) -> None:
+        """Queue a run for execution when a worker becomes available."""
+        import ray
+        import time
+        from typing import Any
+
+        @ray.remote  # type: ignore[misc]
+        def wait_and_submit(pool_handle: Any, run_id: str, entrypoint: str, max_wait: int = 300) -> dict[str, Any]:
+            """Wait for an available worker and submit the run."""
+            start_time = time.time()
+            while time.time() - start_time < max_wait:
+                result: dict[str, Any] = ray.get(pool_handle.submit_run.remote(run_id, entrypoint))
+                if result["success"]:
+                    return result
+                time.sleep(1)
+            return {"success": False, "error": "Timeout waiting for available worker"}
+
+        # Submit the queuing task asynchronously
+        wait_and_submit.remote(self.worker_pool, run.run_id, entrypoint)  # type: ignore[attr-defined]
 
     def _launch_ray_job(self, submission_id: str, entrypoint: str, run: DagsterRun):
         # note: entrypoint is a shell command
@@ -247,7 +484,13 @@ class RayRunLauncher(RunLauncher, ConfigurableClass):
         # wrap the json in quotes to prevent erros with shell commands
         args[-1] = "'" + args[-1] + "'"
 
-        self._launch_ray_job(submission_id, " ".join(args), run)
+        entrypoint = " ".join(args)
+
+        # Use actor pool if enabled
+        if self.actor_pool_config.enabled:
+            self._launch_via_actor_pool(run, entrypoint)
+        else:
+            self._launch_ray_job(submission_id, entrypoint, run)
 
     def terminate(self, run_id: str) -> bool:
         dg._check.str_param(run_id, "run_id")
@@ -257,6 +500,22 @@ class RayRunLauncher(RunLauncher, ConfigurableClass):
             return False
 
         self._instance.report_run_canceling(run)
+
+        # Try actor pool termination first if enabled
+        if self.actor_pool_config.enabled and self._worker_pool is not None:
+            try:
+                import ray
+
+                result = ray.get(self._worker_pool.cancel_run.remote(run_id))
+                if result:
+                    self._instance.report_engine_event(
+                        message="Run was terminated successfully via actor pool.",
+                        dagster_run=run,
+                        cls=self.__class__,
+                    )
+                    return True
+            except Exception:
+                pass  # Fall through to job submission termination
 
         submission_id = get_job_submission_id_from_run_id(
             run.run_id, resume_attempt_number=self._instance.count_resume_run_attempts(run.run_id)
@@ -297,6 +556,30 @@ class RayRunLauncher(RunLauncher, ConfigurableClass):
 
     def check_run_worker_health(self, run: DagsterRun):
         from ray.job_submission import JobStatus
+        from typing import Any
+
+        # Check actor pool first if enabled
+        if self.actor_pool_config.enabled and self._worker_pool is not None:
+            try:
+                import ray
+
+                run_status: dict[str, Any] | None = ray.get(
+                    self._worker_pool.get_run_status.remote(run.run_id)  # type: ignore[union-attr]
+                )
+                if run_status is not None:
+                    if run_status["completed"]:
+                        result: dict[str, Any] = run_status["result"]
+                        if result.get("success"):
+                            return CheckRunHealthResult(WorkerStatus.SUCCESS)
+                        else:
+                            return CheckRunHealthResult(
+                                WorkerStatus.FAILED,
+                                f"Actor pool run failed: {result.get('error', result.get('stderr', 'Unknown error'))}",
+                            )
+                    else:
+                        return CheckRunHealthResult(WorkerStatus.RUNNING)
+            except Exception:
+                pass  # Fall through to job submission check
 
         if self.supports_run_worker_crash_recovery:
             resume_attempt_number = self._instance.count_resume_run_attempts(run.run_id)

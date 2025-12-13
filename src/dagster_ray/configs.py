@@ -65,6 +65,51 @@ class RayJobSubmissionClientConfig(dg.Config):
     )
 
 
+class ActorPoolConfig(dg.Config):
+    """Configuration for the prewarmed actor pool."""
+
+    enabled: bool = Field(
+        default=False,
+        description="Whether to use the prewarmed actor pool instead of job submission.",
+    )
+    num_workers: int = Field(
+        default=2,
+        description="Number of worker actors to prewarm in the pool.",
+    )
+    worker_num_cpus: float | None = Field(
+        default=None,
+        description="Number of CPUs to allocate per worker actor.",
+    )
+    worker_num_gpus: float | None = Field(
+        default=None,
+        description="Number of GPUs to allocate per worker actor.",
+    )
+    worker_memory: int | None = Field(
+        default=None,
+        description="Amount of memory in bytes to allocate per worker actor.",
+    )
+    worker_resources: dict[str, float] | None = Field(
+        default=None,
+        description="Custom resources to allocate per worker actor.",
+    )
+    worker_runtime_env: dict[str, Any] | None = Field(
+        default=None,
+        description="Runtime environment for worker actors.",
+    )
+    auto_scale: bool = Field(
+        default=False,
+        description="Whether to automatically scale the pool based on demand.",
+    )
+    max_workers: int = Field(
+        default=10,
+        description="Maximum number of workers when auto-scaling is enabled.",
+    )
+    queue_runs: bool = Field(
+        default=True,
+        description="Whether to queue runs when no workers are available. If False, falls back to job submission.",
+    )
+
+
 class ExecutionOptionsConfig(dg.Config):
     cpu: int | None = None
     gpu: int | None = None

@@ -1,5 +1,6 @@
 from dagster_ray._base.resources import RayResource
-from dagster_ray.configs import Lifecycle
+from dagster_ray.configs import ActorPoolConfig, Lifecycle
+from dagster_ray.core.actor_pool import DagsterWorkerPool
 from dagster_ray.core.executor import ray_executor
 from dagster_ray.core.io_manager import RayIOManager
 from dagster_ray.core.pipes import PipesRayJobClient, PipesRayJobMessageReader
@@ -15,4 +16,6 @@ __all__ = [
     "ray_executor",
     "PipesRayJobMessageReader",
     "PipesRayJobClient",
+    "ActorPoolConfig",
+    "DagsterWorkerPool",
 ]
